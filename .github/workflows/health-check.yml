@@ -1,0 +1,117 @@
+# Vigilancia externa de disponibilidad de agruxgen.com
+#
+# Vive en un repositorio propio y publico a proposito, por dos razones:
+#
+#   1. Independencia. Un monitor alojado en la misma maquina que vigila no sirve:
+#      cuando cae el servidor, cae con el. Este corre en la infraestructura de
+#      GitHub, sin ninguna dependencia del servidor observado.
+#   2. Coste. GitHub Actions es ilimitado en repositorios publicos, asi que puede
+#      comprobar cada 15 minutos indefinidamente y gratis. En un repo privado
+#      consumiria cuota y, al agotarse, GitHub dejaria de ejecutarlo EN SILENCIO
+#      — justo el modo de fallo que este fichero existe para evitar.
+#
+# No contiene secretos ni datos internos: solo consulta endpoints ya publicos.
+#
+# Si falla, GitHub envia un email al propietario del repositorio.
+
+name: Health check produccion
+
+on:
+  schedule:
+    - cron: '*/15 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  BASE_URL: https://www.agruxgen.com
+  ATTEMPTS: '3'
+  RETRY_WAIT_SECONDS: '20'
+
+jobs:
+  health:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Dependencias del sistema
+        run: |
+          set -uo pipefail
+
+          for i in $(seq 1 "$ATTEMPTS"); do
+            echo "--- Intento $i de $ATTEMPTS ---"
+
+            code=$(curl -sS -o /tmp/health.json -w '%{http_code}' \
+              --max-time 30 "$BASE_URL/api/health" 2>/dev/null || echo "000")
+
+            echo "HTTP $code"
+            cat /tmp/health.json 2>/dev/null || true
+            echo
+
+            if [ "$code" = "200" ]; then
+              # Un 200 puede traer status "warn": algo necesita atencion sin estar
+              # caido (por ejemplo un certificado a punto de caducar). Eso tambien
+              # debe avisar, y no tiene sentido reintentarlo.
+              if grep -q '"status":"ok"' /tmp/health.json; then
+                echo "OK - todas las dependencias responden."
+                exit 0
+              fi
+              echo
+              echo "AVISO: el sitio funciona pero algo necesita atencion."
+              echo "  Revisa que check aparece distinto de 'ok' arriba."
+              exit 1
+            fi
+
+            if [ "$i" -lt "$ATTEMPTS" ]; then
+              sleep "$RETRY_WAIT_SECONDS"
+            fi
+          done
+
+          echo
+          echo "FALLO: /api/health no respondio 200 tras $ATTEMPTS intentos."
+          echo "  HTTP 503 -> el sitio vive pero una dependencia esta caida."
+          echo "  HTTP 000 -> el sitio no responde (servidor, DNS o certificado)."
+          exit 1
+
+      - name: Flujo de login real
+        run: |
+          set -uo pipefail
+
+          # Recorre el mismo camino que un usuario al pulsar "entrar": pide el
+          # token CSRF y hace el POST de signin. Debe redirigir al proveedor de
+          # identidad. Detecta roturas del login que /api/health no cubra.
+          for i in $(seq 1 "$ATTEMPTS"); do
+            echo "--- Intento $i de $ATTEMPTS ---"
+            jar=$(mktemp)
+
+            csrf=$(curl -sS -c "$jar" --max-time 30 "$BASE_URL/api/auth/csrf" 2>/dev/null \
+              | sed -E 's/.*"csrfToken":"([^"]*)".*/\1/')
+
+            if [ -n "$csrf" ]; then
+              location=$(curl -sS -i -b "$jar" --max-time 30 \
+                -X POST "$BASE_URL/api/auth/signin/auth0" \
+                -d "csrfToken=$csrf&callbackUrl=$BASE_URL/" 2>/dev/null \
+                | grep -i '^location:' | tr -d '\r')
+
+              case "$location" in
+                *auth0.com/authorize*)
+                  echo "OK - el login redirige al proveedor de identidad."
+                  rm -f "$jar"
+                  exit 0
+                  ;;
+              esac
+              echo "Redireccion inesperada."
+            else
+              echo "No se pudo obtener el token CSRF."
+            fi
+
+            rm -f "$jar"
+            if [ "$i" -lt "$ATTEMPTS" ]; then
+              sleep "$RETRY_WAIT_SECONDS"
+            fi
+          done
+
+          echo
+          echo "FALLO: el login NO redirige al proveedor de identidad."
+          echo "  Los usuarios no pueden entrar."
+          exit 1
