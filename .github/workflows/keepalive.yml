@@ -1,0 +1,40 @@
+# Mantiene vivo el repositorio.
+#
+# GitHub desactiva los workflows programados cuando un repositorio pasa 60 dias
+# sin actividad. Este repo casi no cambia — su gracia es precisamente que el
+# fichero de vigilancia se quede quieto —, asi que sin esto el monitor se
+# apagaria solo al cabo de dos meses. Y se apagaria EN SILENCIO, que es el modo
+# de fallo que toda esta vigilancia existe para evitar.
+#
+# Escribe una marca de tiempo una vez al mes. 12 commits al ano, suficiente para
+# que el contador de inactividad no llegue nunca a 60 dias.
+
+name: Mantener vivo
+
+on:
+  schedule:
+    # Dia 1 de cada mes a las 03:00 UTC
+    - cron: '0 3 1 * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  keepalive:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Escribir marca de tiempo
+        run: |
+          set -euo pipefail
+          date -u '+%Y-%m-%d %H:%M:%S UTC' > .keepalive
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add .keepalive
+          # Si por lo que sea no hay cambios, no fallar.
+          git diff --staged --quiet && echo "sin cambios" && exit 0
+          git commit -m "chore: mantener activo el repositorio"
+          git push
